@@ -1,0 +1,19 @@
+fastapi
+uvicorn
+websockets
+python-multipart
+pillow
+numpy
+pyngrok
+torchvision
+torchaudio
+transformers
+accelerate
+sentencepiece
+soundfile
+librosa
+decord
+moviepy
+qwen_omni_utils
+bitsandbytes
+torch --index-url https://download.pytorch.org/whl/cu130
