@@ -1,19 +1,48 @@
-fastapi
-uvicorn
-websockets
-python-multipart
-pillow
-numpy
-pyngrok
-torchvision
-torchaudio
-transformers
-accelerate
-sentencepiece
-soundfile
-librosa
-decord
-moviepy
-qwen_omni_utils
-bitsandbytes
-torch --index-url https://download.pytorch.org/whl/cu130
+# EmoConvey Backend — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# NOTE: Install PyTorch FIRST with CUDA support before running this:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# Then install the rest:
+#   pip install -r requirements.txt
+
+# ── Web server ────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+python-dotenv>=1.0.0
+
+# ── HTTP client (Emotion-LLaMA Gradio API calls) ─────────────
+requests>=2.31.0
+
+# ── Image & video processing ──────────────────────────────────
+Pillow>=10.0.0
+opencv-python>=4.7.0.72
+moviepy==1.0.3          # pinned — required by Emotion-LLaMA
+imageio==2.28.1         # required by moviepy 1.0.3
+imageio-ffmpeg>=0.4.7   # ffmpeg backend for moviepy
+
+# ── Audio processing ──────────────────────────────────────────
+librosa>=0.10.0
+soundfile>=0.12.1
+numba>=0.57.0           # required by librosa
+
+# ── Quantization — Windows-compatible ────────────────────────
+# bitsandbytes 0.43+ has official Windows CUDA 12.x support
+bitsandbytes>=0.43.0
+accelerate>=0.27.0
+transformers>=4.39.0    # must be >=4.39 for bitsandbytes 0.43 compatibility
+
+# ── Download utilities (used by setup_emotion_llama.py) ───────
+huggingface_hub>=0.22.0
+hf-transfer>=0.1.6      # faster HuggingFace downloads
+gdown>=5.1.0
+
+# ── Ngrok tunnel ──────────────────────────────────────────────
+pyngrok>=7.0.0
+
+# ── YAML config patching (used by setup_emotion_llama.py) ─────
+PyYAML>=6.0
+
+# ── Git (clone via subprocess — must be installed system-wide) ─
+# Not a pip package. Ensure `git` is available:  git --version
