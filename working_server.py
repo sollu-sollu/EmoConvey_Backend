@@ -200,18 +200,18 @@ def init_emotion_llama() -> bool:
 
 # Emotion-specific prompt for Live Mode (Video/Audio)
 EMOTION_PROMPT = (
-    "You are EmoAI, a direct and empathetic assistant. "
-    "STRICT INSTRUCTION: DO NOT include any introductions, preambles, or conversational fillers like 'Sure!', 'I can help', or 'Based on the image'. "
-    "MANDATORY FORMAT (Start IMMEDIATELY with this):\n"
+    "You are EmoAI, a short, direct and empathetic assistant. "
+    "STRICT RULE: RESPOND IN EXACTLY ONE CONCISE SENTENCE (MAX 15 WORDS). "
+    "MANDATORY FORMAT:\n"
     "[TRANSCRIPTION: exact words user said]\n"
     "[Emotion] (one word)\n"
     "Your natural response.\n"
 )
 
 IMAGE_ONLY_PROMPT = (
-    "STRICT INSTRUCTION: NO PREAMBLE. Analyze the person's facial expression. "
+    "STRICT: NO PREAMBLE. Analyze facial expression. "
     "Start with [Emotion] matching what you see. "
-    "Give a short warm observation (1–2 sentences)."
+    "Short analysis (1 sentence)."
 )
 
 TEXT_ONLY_PROMPT_TEMPLATE = (
@@ -522,14 +522,47 @@ async def process_multimodal_input(data: dict, history: list):
     msg_type = data.get('type', '')
 
     if mock_mode:
-        return _process_mock(msg_type, data)
+        return json.dumps({"emotion": "neutral", "response": "Mock mode active.", "transcription": "Mock transcription"})
 
     async with processing_lock:
         if msg_type == 'multimodal':
             return await _process_multimodal_turn(data, history)
         elif msg_type == 'chat_multimodal':
             return await _process_chat_multimodal(data, history)
+        elif msg_type == 'image':
+            return await _process_image_frame(data)
         return await _process_local(msg_type, data.get('data', ''), history)
+
+async def _process_image_frame(data: dict):
+    """Special handler for silent background mood analysis."""
+    try:
+        start = time.time()
+        media_b64 = data.get('data', '')
+        if media_b64.startswith("data:"):
+            media_b64 = media_b64.split("base64,")[-1]
+
+        ipath = os.path.join(tempfile.gettempdir(), f"mood_{int(time.time())}.jpg")
+        vpath = os.path.join(tempfile.gettempdir(), f"mood_{int(time.time())}.mp4")
+        
+        with open(ipath, "wb") as f:
+            f.write(base64.b64decode(media_b64))
+        
+        # Build silent short video
+        _build_silent_video_from_image(ipath, vpath, duration=1.0)
+        
+        # Fast API call
+        raw = await asyncio.get_event_loop().run_in_executor(None, _call_emotion_llama_api, vpath, IMAGE_ONLY_PROMPT)
+        emo, text, _, _ = extract_emotion_and_text(raw)
+        
+        return json.dumps({
+            "emotion": emo,
+            "response": text,
+            "silent": True,
+            "time": round(time.time() - start, 1)
+        })
+    except Exception as e:
+        logger.warning(f"Background mood analysis failed: {e}")
+        return None
 
 async def _process_chat_multimodal(data: dict, history: list):
     """Process a chat payload containing text + an optional image or audio."""
@@ -1051,10 +1084,7 @@ def health_check():
         "status": "ok",
         "device": DEVICE,
         "gradio_server": "ready" if gradio_ok else "offline",
-        "mock_mode": mock_mode,
     }
-
-
 # ============================================================
 # Entry Point
 # ============================================================
