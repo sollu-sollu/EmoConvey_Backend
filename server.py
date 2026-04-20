@@ -8,6 +8,17 @@ import logging
 import os
 import sys
 import tempfile
+
+# Force UTF-8 encoding for Windows console to handle emojis
+if sys.platform == "win32":
+    try:
+        # Use reconfigure() if available (Python 3.7+) - much safer than re-wrapping
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 import asyncio
 import subprocess
 import time
@@ -117,7 +128,7 @@ def _start_gradio_server() -> bool:
     env["PYTHONPATH"] = EMOTION_LLAMA_DIR + os.pathsep + env.get("PYTHONPATH", "")
     # Ensure CUDA is visible to subprocess
     env["CUDA_VISIBLE_DEVICES"] = "0"
-
+    env["PYTHONUTF8"] = "1"
     _gradio_process = subprocess.Popen(
         [sys.executable, app_py,
          "--cfg-path", EMOTION_LLAMA_DEMO_CFG],
@@ -126,6 +137,8 @@ def _start_gradio_server() -> bool:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         bufsize=1,
     )
 
@@ -177,26 +190,26 @@ def init_emotion_llama() -> bool:
 # System Prompt & Response Parsing
 # ============================================================
 
-# Emotion-specific prompt injected into every Gradio API call
+# Emotion-specific prompt for Live Mode (Video/Audio)
 EMOTION_PROMPT = (
-    "You are EmoAI, a helpful and empathetic AI assistant. "
-    "Analyze the emotional state of the person based on their face, voice, and words. "
-    "Follow these steps for EVERY response: "
-    "1. Write [TRANSCRIPTION: <exact words the user said>]. "
-    "2. Detect the primary emotion and write [Emotion] (e.g., [Happy], [Sad], [Angry]). "
-    "3. Respond naturally — answer questions, give advice, or continue the conversation."
+    "You are EmoAI, a direct and empathetic assistant. "
+    "STRICT INSTRUCTION: DO NOT include any introductions, preambles, or conversational fillers like 'Sure!', 'I can help', or 'Based on the image'. "
+    "MANDATORY FORMAT (Start IMMEDIATELY with this):\n"
+    "[TRANSCRIPTION: exact words user said]\n"
+    "[Emotion] (one word)\n"
+    "Your natural response.\n"
 )
 
 IMAGE_ONLY_PROMPT = (
-    "Analyze the person's facial expression. "
+    "STRICT INSTRUCTION: NO PREAMBLE. Analyze the person's facial expression. "
     "Start with [Emotion] matching what you see. "
     "Give a short warm observation (1–2 sentences)."
 )
 
 TEXT_ONLY_PROMPT_TEMPLATE = (
     "The user says: \"{user_text}\". "
-    "You are EmoAI. Detect emotion from their words and write [Emotion]. "
-    "Then respond naturally and helpfully."
+    "You are EmoAI. Respond in this EXACT format (NO INTRODUCTIONS):\n"
+    "[Emotion] Your helpful and natural response."
 )
 
 
@@ -229,46 +242,84 @@ def extract_emotion_and_text(response: str):
         is_silent = True
         response = re.sub(r'\[SILENT\]', '', response, flags=re.IGNORECASE).strip()
 
-    # 3. Extract emotion bracket: [Happy], [Emotion: Happy], [emotion:sad], etc.
-    match = re.search(
-        r'\[(?:emotion:?\s*|detected_emotion:?\s*|feelings:?\s*)?(\w+)\]\s*(.*)',
-        response, re.DOTALL | re.IGNORECASE
+    # 3. Extract the Emotion (Official Detection)
+    # This looks for [Happy], detected: happy, mood: happy, or emotion: happy
+    emotion = "neutral"
+    emo_match = re.search(
+        r'\[(\w+)\]|(?i)detected:?\s*(\w+)|(?i)mood:?\s*(\w+)|(?i)emotion:?\s*(\w+)', 
+        response
     )
-    if match:
-        emotion = match.group(1).lower()
-        text = match.group(2).strip()
-        if not text:
-            text = "I'm here with you."
-        return emotion, text, transcription, is_silent
+    if emo_match:
+        # Use whichever group matched
+        found = emo_match.group(1) or emo_match.group(2) or emo_match.group(3) or emo_match.group(4)
+        emotion = found.lower()
+    else:
+        # Keyword fallback if no brackets
+        emotion_keywords = {
+            'happy':     ['happy', 'joy', 'cheerful', 'smile', 'grin', 'laugh'],
+            'sad':       ['sad', 'unhappy', 'down', 'depressed', 'upset'],
+            'angry':     ['angry', 'anger', 'furious', 'annoyed', 'frustrated'],
+            'anxious':   ['anxious', 'worried', 'nervous', 'stressed', 'tense'],
+            'calm':      ['calm', 'relaxed', 'peaceful', 'serene'],
+            'surprised': ['surprised', 'shocked', 'astonished'],
+            'tired':     ['tired', 'exhausted', 'fatigue', 'sleepy'],
+        }
+        lower_resp = response.lower()
+        for emo_key, cues in emotion_keywords.items():
+            if any(cue in lower_resp for cue in cues):
+                emotion = emo_key
+                break
 
-    # 4. Fallback: any single bracketed word
-    bracket_match = re.search(r'\[(\w+)\]', response)
-    if bracket_match:
-        emotion = bracket_match.group(1).lower()
-        text = re.sub(r'\[.*?\]', '', response).strip()
-        if not text:
-            text = "I'm here with you."
-        return emotion, text, transcription, is_silent
+    # 4. Clean the text bubble (Remove preambles and analytical leaks)
+    text = response
 
-    # 5. Keyword fallback
-    emotion_keywords = {
-        'happy':     ['happy', 'joy', 'cheerful', 'smile', 'grin', 'laugh', 'delighted'],
-        'sad':       ['sad', 'unhappy', 'down', 'depressed', 'melancholy', 'upset'],
-        'angry':     ['angry', 'anger', 'furious', 'irritated', 'annoyed', 'frustrated'],
-        'anxious':   ['anxious', 'worried', 'nervous', 'stressed', 'tense', 'concerned'],
-        'calm':      ['calm', 'relaxed', 'peaceful', 'serene', 'composed'],
-        'surprised': ['surprised', 'shocked', 'astonished', 'amazed'],
-        'tired':     ['tired', 'exhausted', 'fatigue', 'sleepy', 'weary'],
-        'focused':   ['focused', 'concentrated', 'attentive', 'engaged'],
-        'neutral':   ['neutral', 'normal', 'content', 'fine', 'okay'],
-    }
-    lower = response.lower()
-    for emo, keywords in emotion_keywords.items():
-        for kw in keywords:
-            if kw in lower:
-                return emo, response, transcription, is_silent
+    # Handle numbered lists often generated by some models (1. Emotion... 2. Response...)
+    # We prioritize anything after "[Emotion]" or "Emotion:" or "Response:"
+    split_patterns = [
+        r'\[\w+\]',                             # [Emotion]
+        r'(?i)^\d+\.\s*(Response:?|Text:?)',    # 2. Response:
+        r'(?i)^(Response:?|Text:?)\s*',         # Response:
+    ]
+    
+    for sp in split_patterns:
+        match = re.search(sp, text, re.MULTILINE)
+        if match:
+            text = text[match.end():].strip()
+            break # Found the start of the body
 
-    return 'neutral', response if response else "I'm here with you.", transcription, is_silent
+    # Remove analytical "Model-Speak" observations and conversational fillers
+    leak_patterns = [
+        r'^(Sure!|Certainly!|Of course!|I\'d be happy to help!|Here\'s my response:?|Here is my response:?|I can continue the conversation.*?\.)',
+        r'(?i)^Based on (the image|the video|your|what).*?(\.\s*|\:\s*)',
+        r'(?i)^I (can|see|detect|notice|observe).*?(\.\s*|\:\s*)',
+        r'^\d+\.\s*(Emotion:?|Response:?)?\s*', # Strip "1. Emotion: " or "2. Response: " remnant
+        r'\[.*?\]',                        # Remaining [Happy]
+        r'(?i)detected:?\s*\w+',           # detected: calm
+        r'(?i)detected emotion:?\s*\w+',   # detected emotion: happy
+        r'(?i)emotion:?\s*\w+',            # emotion: sad
+        r'(?i)mood:?\s*\w+',               # mood: neutral
+        r'^(EmoAI|Assistant|AI|System):\s*', 
+    ]
+    
+    # Run the filters
+    for _ in range(2): # Double pass for nested leaks
+        for pattern in leak_patterns:
+            text = re.sub(r'^\d+\.\s*', '', text, flags=re.MULTILINE).strip()
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL).strip()
+    
+    # Emoji Map for specific tokens
+    emoji_map = {':heartbreak:': '💔', ':empathy:': '🤝', ':happy:': '😊', ':sad:': '😢'}
+    for token, emoji in emoji_map.items():
+        text = text.replace(token, emoji)
+    
+    # Final cleanup: Remove stray :tokens: and redundant white space
+    text = re.sub(r':[a-z_]+:', '', text).strip()
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    if not text:
+        text = "I'm here with you."
+
+    return emotion, text, transcription, is_silent
 
 
 def correct_emotion_from_text(emotion: str, response_text: str) -> str:
@@ -384,8 +435,103 @@ async def process_multimodal_input(data: dict, history: list):
     async with processing_lock:
         if msg_type == 'multimodal':
             return await _process_multimodal_turn(data, history)
+        elif msg_type == 'chat_multimodal':
+            return await _process_chat_multimodal(data, history)
         return await _process_local(msg_type, data.get('data', ''), history)
 
+async def _process_chat_multimodal(data: dict, history: list):
+    """Process a chat payload containing text + an optional image or audio."""
+    try:
+        start = time.time()
+        text_data = data.get('data', '')
+        media_b64 = data.get('media', '')
+        media_type = data.get('media_type', 'image')
+        audio_b64 = data.get('audio', '')
+
+        # Clean base64 prefixes if present from RNFS
+        if media_b64 and media_b64.startswith("data:"):
+            media_b64 = media_b64.split("base64,")[-1]
+            
+        if audio_b64 and audio_b64.startswith("data:"):
+            audio_b64 = audio_b64.split("base64,")[-1]
+
+        history.append({"role": "user", "content": text_data or "[User sent attachment]"})
+
+        history_context = ""
+        if len(history) > 2:
+            recent = history[-6:-1]
+            history_context = " ".join(
+                f"{'User' if h['role']=='user' else 'EmoAI'}: {h['content']}"
+                for h in recent
+            )
+
+        # Override the text-only prompt if we have media
+        prompt = f"The user says: \"{text_data}\". You are EmoAI. "
+        if media_b64:
+            prompt += f"Look at the attached {media_type} carefully. "
+        if audio_b64:
+            prompt += "Listen to the attached audio tone carefully. "
+        
+        prompt += "First detect the emotion and write [Emotion]. Then respond naturally to their text."
+        
+        if history_context:
+            prompt = f"Conversation trace: {history_context}. {prompt}"
+
+        video_path = "None"
+        black_img_path = os.path.join(tempfile.gettempdir(), "emoconvey_black_frame.jpg")
+
+        if media_b64:
+            video_path = os.path.join(tempfile.gettempdir(), "emoconvey_chat_video.mp4")
+            if media_type == 'video':
+                # Write video bytes directly
+                with open(video_path, "wb") as f:
+                    f.write(base64.b64decode(media_b64))
+            else:
+                img_path = os.path.join(tempfile.gettempdir(), "emoconvey_chat_img.jpg")
+                _save_image_from_b64(media_b64, img_path)
+                if audio_b64:
+                    audio_path = os.path.join(tempfile.gettempdir(), "emoconvey_chat_audio.wav")
+                    with open(audio_path, "wb") as f:
+                        f.write(base64.b64decode(audio_b64))
+                    _build_video_from_image_audio(img_path, audio_path, video_path)
+                else:
+                    _build_silent_video_from_image(img_path, video_path)
+        elif audio_b64:
+            video_path = os.path.join(tempfile.gettempdir(), "emoconvey_chat_audio_only.mp4")
+            audio_path = os.path.join(tempfile.gettempdir(), "emoconvey_chat_audio.wav")
+            with open(audio_path, "wb") as f:
+                f.write(base64.b64decode(audio_b64))
+            if not os.path.exists(black_img_path):
+                Image.new("RGB", (224, 224), color=(0, 0, 0)).save(black_img_path, "JPEG")
+            _build_video_from_image_audio(black_img_path, audio_path, video_path)
+        else:
+            video_path = "None"
+
+        raw_response = await asyncio.get_event_loop().run_in_executor(
+            None, _call_emotion_llama_api, video_path, prompt
+        )
+
+        elapsed = time.time() - start
+        emotion, response_text, _, _ = extract_emotion_and_text(raw_response)
+        
+        # Save to history
+        history.append({"role": "assistant", "content": response_text})
+
+        return json.dumps({
+            "emotion": emotion,
+            "response": response_text,
+            "source": "chat",
+            "time": round(elapsed, 1),
+            "silent": False
+        })
+    except Exception as e:
+        logger.error(f"Chat Multimodal Error: {e}")
+        return json.dumps({
+            "emotion": "neutral",
+            "response": "Sorry, I couldn't process the attachments.",
+            "source": "error",
+            "silent": False
+        })
 
 async def _process_local(msg_type: str, msg_data: str, history: list):
     """Process single-mode inputs (image-only, audio-only, text-only)."""
@@ -495,12 +641,9 @@ async def _process_local(msg_type: str, msg_data: str, history: list):
             if history_context:
                 prompt = f"Conversation so far: {history_context}. " + prompt
 
-            # Use a black-frame silent video as placeholder for text-only
-            black_img_path = os.path.join(tempfile.gettempdir(), "emoconvey_black_frame.jpg")
-            video_path     = os.path.join(tempfile.gettempdir(), "emoconvey_text_video.mp4")
-            if not os.path.exists(black_img_path):
-                Image.new("RGB", (224, 224), color=(0, 0, 0)).save(black_img_path, "JPEG")
-            _build_silent_video_from_image(black_img_path, video_path)
+            # Since app_EmotionLlamaClient is now patched, we natively pass "None" 
+            # to instruct the model to do pure text regression without compiling video dummy frames.
+            video_path = "None"
 
             raw_response = await asyncio.get_event_loop().run_in_executor(
                 None, _call_emotion_llama_api, video_path, prompt
