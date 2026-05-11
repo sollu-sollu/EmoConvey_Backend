@@ -100,60 +100,8 @@ logger.info(f"PyTorch Device: {DEVICE} | VRAM: {EMOTION_LLAMA_VRAM_GB:.1f} GB | 
 # ============================================================
 
 mock_mode = False
-processing_lock = asyncio.Lock()   # Main pipeline (audio / transcribe / chat)
-mood_lock = asyncio.Lock()         # Background image mood — separate so it never blocks audio
+processing_lock = asyncio.Lock()
 _gradio_process = None   # handle to the Emotion-LLaMA subprocess
-
-# ── Whisper STT ──────────────────────────────────────────────────────────────
-# Whisper runs locally on GPU. Lazy-loaded on first use so startup is fast.
-_whisper_model = None
-_whisper_load_attempted = False
-
-def _load_whisper():
-    """Lazy-load Whisper. Uses 'base' on >=6 GB VRAM, 'tiny' on smaller GPUs."""
-    global _whisper_model, _whisper_load_attempted
-    if _whisper_load_attempted:
-        return _whisper_model  # Already tried (may be None if install failed)
-    _whisper_load_attempted = True
-    try:
-        import whisper
-        model_size = "base" if EMOTION_LLAMA_VRAM_GB >= 6 else "tiny"
-        logger.info(f"🎤 Loading Whisper '{model_size}' for STT on {DEVICE}...")
-        _whisper_model = whisper.load_model(model_size, device=DEVICE)
-        logger.info(f"✅ Whisper STT ready ({model_size})")
-    except Exception as e:
-        logger.warning(f"⚠️ Whisper not available: {e}")
-        logger.warning("   Install: pip install openai-whisper")
-    return _whisper_model
-
-def whisper_transcribe(audio_path: str) -> str:
-    """Transcribe a WAV file to text using Whisper.
-
-    Loads audio via librosa (no FFmpeg required) and passes the numpy
-    float32 array directly to Whisper. Returns '' on failure.
-    """
-    try:
-        model = _load_whisper()
-        if model is None:
-            return ""
-
-        # Load audio as float32 numpy array at 16kHz (Whisper's native rate)
-        # This avoids Whisper's internal FFmpeg call entirely
-        import librosa
-        audio_array, _ = librosa.load(audio_path, sr=16000, mono=True)
-
-        result = model.transcribe(
-            audio_array,          # numpy float32 array, not a file path
-            fp16=(DEVICE == "cuda"),
-            language="en",
-            task="transcribe"
-        )
-        text = result.get("text", "").strip()
-        logger.info(f"🎤 Whisper STT: '{text}'")
-        return text
-    except Exception as e:
-        logger.warning(f"Whisper transcription failed: {e}")
-        return ""
 
 # ============================================================
 # Emotion-LLaMA Server Management
@@ -535,51 +483,36 @@ async def process_multimodal_input(data: dict, history: list):
     if mock_mode:
         return json.dumps({"emotion": "neutral", "response": "Mock mode active.", "transcription": "Mock transcription"})
 
-    # Background image mood check: runs on its OWN lock so it never blocks audio turns
-    if msg_type == 'image':
-        if mood_lock.locked():
-            return None  # Skip this frame — previous mood check still running
-        async with mood_lock:
-            return await _process_image_frame(data)
-
     async with processing_lock:
         if msg_type == 'transcribe':
-            # ── Combined Whisper STT + Emotion-LLaMA in ONE call ───────────────────
-            # 1. Whisper → text (no FFmpeg, no copyright refusal)
-            # 2. Text + face image → Emotion-LLaMA → [Emotion] + response
-            # App gets a full multimodal response — no verify card stop needed
+            # Fast-path for verifying spoken words before sending to AI
             audio_b64 = data.get('audio', '')
-            image_b64 = data.get('image', '')
-            if not audio_b64:
-                return json.dumps({"source": "multimodal", "emotion": "neutral", "response": "", "silent": True})
-
+            if not audio_b64: return json.dumps({"transcription": ""})
+            
+            # Use a black frame video for the transcription turn
             audio_path = os.path.join(tempfile.gettempdir(), "emoconvey_trans_audio.wav")
             with open(audio_path, "wb") as f:
                 f.write(base64.b64decode(audio_b64))
-
-            # Step 1: Whisper → text
-            trans = await asyncio.get_event_loop().run_in_executor(
-                None, whisper_transcribe, audio_path
-            )
-
-            if not trans:
-                # Pure silence / noise — skip Emotion-LLaMA, silent turn
-                logger.info("🤫 No speech detected — skipping Emotion-LLaMA")
-                return json.dumps({
-                    "source": "multimodal",
-                    "emotion": "neutral",
-                    "response": "",
-                    "transcription": "",
-                    "silent": True
-                })
-
-            # Step 2: Emotion-LLaMA with pre-computed whisper text
-            turn_data = {
-                'audio': audio_b64,
-                'image': image_b64,
-                'isCamOn': bool(image_b64 and len(image_b64) > 100),
-            }
-            return await _process_multimodal_turn(turn_data, history, whisper_text=trans)
+            
+            black_img_path = os.path.join(tempfile.gettempdir(), "emoconvey_black_frame.jpg")
+            if not os.path.exists(black_img_path):
+                Image.new("RGB", (224, 224), color=(0, 0, 0)).save(black_img_path, "JPEG")
+            
+            video_path = os.path.join(tempfile.gettempdir(), "emoconvey_trans_video.mp4")
+            _build_video_from_image_audio(black_img_path, audio_path, video_path)
+            
+            # Simple prompt for transcription
+            prompt = "Transcription Task: Transcribe EXACTLY the words heard in the provided audio data. Output ONLY the words. No analysis. No description."
+            raw = await asyncio.get_event_loop().run_in_executor(None, _call_emotion_llama_api, video_path, prompt)
+            
+            # Log the raw response for debugging
+            logger.info(f"🎤 Raw STT Response: '{raw}'")
+            
+            # Clean up the output
+            trans = re.sub(r'\[.*?\]', '', raw).strip()
+            trans = re.sub(r'(?i)^(transcription|text|response):?', '', trans).strip()
+            
+            return json.dumps({"transcription": trans, "source": "stt"})
 
         elif msg_type == 'multimodal':
             return await _process_multimodal_turn(data, history)
@@ -862,104 +795,96 @@ async def _process_local(msg_type: str, msg_data: str, history: list):
         })
 
 
-async def _process_multimodal_turn(data: dict, history: list, whisper_text: str = None):
-    """
-    Process a combined audio + optional face image turn.
-
-    Pipeline (Whisper-based):
-      1. Whisper transcribes the audio → clean text (or uses pre-computed whisper_text)
-      2. Face image → silent video (for facial emotion reading)
-      3. Emotion-LLaMA: text question + face video → [Emotion] + reply
-    """
+async def _process_multimodal_turn(data: dict, history: list):
+    """Process a combined audio + optional image turn WITH conversation memory."""
     try:
         start = time.time()
 
-        audio_b64 = data.get('audio', '')
-        image_b64 = data.get('image', '')
-        is_cam_on = data.get('isCamOn', False)
+        audio_b64  = data.get('audio', '')
+        image_b64  = data.get('image', '')
+        is_cam_on  = data.get('isCamOn', False)
 
         if not audio_b64:
             return json.dumps({"emotion": "neutral", "response": "No audio received.", "source": "error", "silent": True})
 
-        # ── 1. Save & normalize audio ────────────────────────────────────────
+        # --- Save and normalize audio ---
         audio_path = os.path.join(tempfile.gettempdir(), "emoconvey_turn_audio.wav")
+        audio_data = base64.b64decode(audio_b64)
         with open(audio_path, "wb") as f:
-            f.write(base64.b64decode(audio_b64))
+            f.write(audio_data)
 
         audio_duration = 0.0
         try:
-            import librosa, soundfile as sf
+            import librosa
+            import soundfile as sf
             y, sr = librosa.load(audio_path, sr=16000)
             audio_duration = len(y) / sr
             sf.write(audio_path, y, sr)
-        except Exception:
-            pass
+            logger.info(f"  Audio: {audio_duration:.1f}s @ 16kHz")
+        except Exception as ne:
+            logger.warning(f"  Audio normalization skipped: {ne}")
 
-        # ── 2. Whisper STT ────────────────────────────────────────
-        if whisper_text is not None:
-            # Pre-computed by transcribe handler — skip re-transcription
-            user_text = whisper_text
-        else:
-            user_text = await asyncio.get_event_loop().run_in_executor(
-                None, whisper_transcribe, audio_path
-            )
-        logger.info(f"🎤 Whisper: '{user_text}' (audio={audio_duration:.1f}s)")
-
-        # ── 3. Save face image → build SHORT silent video ────────────────────
-        has_image = is_cam_on and image_b64 and len(image_b64) > 100
+        # --- Save and build video ---
+        has_image  = is_cam_on and image_b64 and len(image_b64) > 100
         video_path = os.path.join(tempfile.gettempdir(), "emoconvey_turn_video.mp4")
-        image_path = None
 
         if has_image:
             image_path = os.path.join(tempfile.gettempdir(), "emoconvey_turn_image.jpg")
             _save_image_from_b64(image_b64, image_path)
-            # Silent video — NO audio track (avoids copyright refusal)
-            _build_silent_video_from_image(image_path, video_path, duration=1.5)
+            built = _build_video_from_image_audio(image_path, audio_path, video_path)
         else:
-            # No camera — text-only mode
-            video_path = "None"
+            # Audio only — use a black placeholder frame
+            black_img_path = os.path.join(tempfile.gettempdir(), "emoconvey_black_frame.jpg")
+            if not os.path.exists(black_img_path):
+                Image.new("RGB", (224, 224), color=(0, 0, 0)).save(black_img_path, "JPEG")
+            built = _build_video_from_image_audio(black_img_path, audio_path, video_path)
 
-        # ── 4. Build a text-based prompt (no "transcription" trigger word) ───
+        if not built:
+            logger.warning("  Video build failed — using silent fallback")
+
+        # --- Build prompt with anti-repetition & history ---
         last_response = history[-1]["content"] if history and history[-1]["role"] == "assistant" else ""
-
-        if user_text:
-            face_hint = "Looking at their face, " if has_image else ""
-            prompt = (
-                f'The person said: "{user_text}". '
-                f'{face_hint}what emotion are they feeling '
-                f'and what is a warm, genuine empathetic reply? '
-                f'Start with [Emotion] on its own line.'
-            )
-        else:
-            # Whisper got nothing (silence / noise) — fall back to face-only
-            prompt = IMAGE_ONLY_PROMPT if has_image else IMAGE_ONLY_PROMPT
-
+        prompt = EMOTION_PROMPT
+        if has_image:
+            prompt += " Look at the person's face AND listen to their voice."
         if last_response:
-            prompt += f' (You already said: "{last_response[:60]}". Say something DIFFERENT.)'
+            prompt += f" IMPORTANT: You already said \"{last_response[:80]}\". Say something DIFFERENT this time."
 
-        logger.info(f"🎨 Turn #{len(history)//2+1} | image={'yes' if has_image else 'no'} | prompt={prompt[:80]}...")
+        # --- Build & log conversation context ---
+        recent_history = history[-6:] if len(history) > 6 else history
+        logger.info(f"🎭 Processing turn #{len(history)//2 + 1} (Audio={audio_duration:.1f}s | Image={'Yes' if has_image else 'No'} | History={len(recent_history)} msgs)...")
+        logger.info(f"📝 Prompt: {prompt[:80]}...")
+        if len(history) > 0:
+            logger.info(f"📜 History Context: {history[-2:]}")
 
-        # ── 5. Call Emotion-LLaMA ─────────────────────────────────────────────
+        # --- Call Emotion-LLaMA ---
         raw_response = await asyncio.get_event_loop().run_in_executor(
             None, _call_emotion_llama_api, video_path, prompt
         )
 
         elapsed = time.time() - start
-        emotion, response_text, _, _ = extract_emotion_and_text(raw_response)
+        emotion, response_text, transcription, _ = extract_emotion_and_text(raw_response)
+
+        logger.info(f"🗣️ Extracted Transcription: '{transcription}'")
+
+        # Cross-check: if text says "you seem down" but bracket says [Relaxed], fix it
         emotion = correct_emotion_from_text(emotion, response_text)
 
-        # ── 6. Update conversation history ────────────────────────────────────
-        history.append({"role": "user",      "content": user_text or "(non-verbal audio)"})
+        # --- Save to history (text only — no blobs) ---
+        user_summary = transcription if transcription else "(user spoke via audio)"
+        history.append({"role": "user", "content": user_summary})
         history.append({"role": "assistant", "content": response_text})
+
+        # Trim history to prevent memory bloat (keep last 10 exchanges = 20 msgs)
         if len(history) > 20:
             history[:] = history[-20:]
 
-        logger.info(f"✅ Turn done in {elapsed:.1f}s → [{emotion}] '{response_text[:60]}'")
+        logger.info(f"✅ Turn done in {elapsed:.1f}s -> {emotion} | \"{response_text[:60]}\"")
 
         return json.dumps({
             "emotion": emotion,
             "response": response_text,
-            "transcription": user_text,  # Whisper text shown in verify card
+            "transcription": transcription,
             "source": "multimodal",
             "time": round(elapsed, 1),
             "silent": False
